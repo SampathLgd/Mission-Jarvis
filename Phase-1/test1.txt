@@ -1,0 +1,14 @@
+.data
+array: .word 3 3 4 3
+n: .string "sorted array: "
+LI X1 10
+LI X2 10
+LI X4 0
+LD X5 500
+LD X6 501
+loop:
+ADDI X4 X4 1
+BEQ X4 X2 exit
+J loop
+exit:
+EXIT

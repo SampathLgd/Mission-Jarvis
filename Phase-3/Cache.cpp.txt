@@ -1,0 +1,395 @@
+#include <bits/stdc++.h>
+
+using namespace std;
+
+class Cache {
+public:
+    enum ReplacementPolicy { LRU, FIFO };
+
+    int cacheSize;
+    int blockSize;
+    int associativity;
+    int numSets;
+    int indexBits;
+    int offsetBits;
+    int tagBits;
+    int accessLatency;
+    ReplacementPolicy replacementPolicy;
+    vector<vector<pair<int, int>>> cache;
+    vector<vector<int>> lru;
+    vector<vector<int>> fifo;
+    int cacheMisses = 0;
+
+    Cache(int cSize, int bSize, int assoc, int latency, ReplacementPolicy policy) {
+        cacheSize = cSize;
+        blockSize = bSize;
+        associativity = assoc;
+        accessLatency = latency;
+        replacementPolicy = policy;
+        offsetBits = log2(blockSize);
+        numSets = cacheSize / (blockSize * associativity);
+        indexBits = log2(numSets);
+        tagBits = 32 - indexBits - offsetBits;
+        cache.resize(numSets, vector<pair<int, int>>(associativity, {-1, 0}));
+        lru.resize(numSets, vector<int>(associativity, 0));
+        fifo.resize(numSets, vector<int>(associativity, 0));
+    }
+
+    void read(int address, int& data, int& stalls, int cycle) {
+        int tag = address >> (indexBits + offsetBits);
+        int index = (address >> offsetBits) & ((1 << indexBits) - 1);
+
+        for (int i = 0; i < associativity; ++i) {
+            if (cache[index][i].first == tag) {
+                data = cache[index][i].second;
+                updateLRU(index, i, cycle);
+                updateFIFO(index, i, cycle);
+                return;
+            }
+        }
+
+        ++cacheMisses;
+        stalls += accessLatency;
+        data = address;
+        if (replacementPolicy == LRU) {
+            int way = findLRU(index);
+            cache[index][way] = {tag, data};
+            updateLRU(index, way, cycle);
+        } else if (replacementPolicy == FIFO) {
+            int way = findFIFO(index);
+            cache[index][way] = {tag, data};
+            updateFIFO(index, way, cycle);
+        } else {
+            assert(false && "Unsupported replacement policy");
+        }
+    }
+
+    void write(int address, int data, int& stalls, int cycle) {
+        int tag = address >> (indexBits + offsetBits);
+        int index = (address >> offsetBits) & ((1 << indexBits) - 1);
+
+        for (int i = 0; i < associativity; ++i) {
+            if (cache[index][i].first == tag) {
+                cache[index][i].second = data;
+                updateLRU(index, i, cycle);
+                updateFIFO(index, i, cycle);
+                return;
+            }
+        }
+
+        ++cacheMisses;
+        stalls += accessLatency;
+        if (replacementPolicy == LRU) {
+            int way = findLRU(index);
+            cache[index][way] = {tag, data};
+            updateLRU(index, way, cycle);
+        } else if (replacementPolicy == FIFO) {
+            int way = findFIFO(index);
+            cache[index][way] = {tag, data};
+            updateFIFO(index, way, cycle);
+        } else {
+            assert(false && "Unsupported replacement policy");
+        }
+    }
+
+private:
+    void updateLRU(int index, int way, int cycle) {
+        lru[index][way] = cycle;
+    }
+
+    void updateFIFO(int index, int way, int cycle) {
+        fifo[index][way] = cycle;
+    }
+
+    int findLRU(int index) {
+        int minCycle = INT_MAX; // Using INT_MAX from <climits>
+        int way = -1;
+        for (int i = 0; i < associativity; ++i) {
+            if (lru[index][i] < minCycle) {
+                minCycle = lru[index][i];
+                way = i;
+            }
+        }
+        return way;
+    }
+
+    int findFIFO(int index) {
+        int minCycle = INT_MAX; // Using INT_MAX from <climits>
+        int way = -1;
+        for (int i = 0; i < associativity; ++i) {
+            if (fifo[index][i] < minCycle) {
+                minCycle = fifo[index][i];
+                way = i;
+            }
+        }
+        return way;
+    }
+};
+
+class Core {
+public:
+    bool exitEncountered = false;
+    array<int, 32> registers;
+    int pc;
+    vector<string> program;
+    bool halted;
+    map<string, int> labelToAddress;
+
+    struct PipelineRegister {
+        string instruction;
+        int rd;
+        int rs1;
+        int rs2;
+        int imm;
+        int cycle;
+    };
+    array<PipelineRegister, 5> pipeline;
+
+    bool dataHazard = false;
+    int stalls = 0;
+
+    map<string, int> instructionLatency = {
+        {"ADD", 1},
+        {"SUB", 1},
+        {"MUL", 3},
+        {"DIV", 4},
+        {"LD", 2},
+        {"ADDI", 1},
+        {"JAL", 1},
+        {"JALR", 1},
+    };
+
+    Core() : pc(0), registers({0}), halted(false) {}
+
+    void execute(vector<int>& memory, bool dataForwarding, Cache& cache) {
+        for (int i = 4; i > 0; --i) {
+            pipeline[i] = pipeline[i - 1];
+        }
+
+        if (pc < program.size()) {
+            int address = pc * 4;
+            int instruction;
+            stalls += cache.accessLatency;
+            cache.read(address, instruction, stalls, pipeline[0].cycle);
+            pipeline[0].instruction = to_string(instruction);
+            ++pc;
+        } else {
+            pipeline[0].instruction = "EXIT";
+            exitEncountered = true;
+        }
+
+        decode(pipeline[1]);
+        executeInstruction(pipeline[2], memory, dataForwarding, cache);
+        writeBack(pipeline[4]);
+    }
+
+    void decode(PipelineRegister& reg) {
+        string instruction = reg.instruction;
+        vector<string> parts;
+        size_t spacePos = instruction.find(' ');
+        string opcode = instruction.substr(0, spacePos);
+        parts.push_back(opcode);
+
+        while (spacePos != std::string::npos) {
+            size_t nextSpacePos = instruction.find(' ', spacePos + 1);
+            string operand = instruction.substr(spacePos + 1, nextSpacePos - spacePos - 1);
+            parts.push_back(operand);
+            spacePos = nextSpacePos;
+        }
+
+        if (opcode == "ADD" || opcode == "SUB" || opcode == "LD" || opcode == "JALR") {
+            reg.rd
+
+ = stoi(parts[1].substr(1));
+            reg.rs1 = stoi(parts[2].substr(1));
+            if (parts.size() > 3)
+                reg.rs2 = stoi(parts[3].substr(1));
+        } else if (opcode == "ADDI") {
+            reg.rd = stoi(parts[1].substr(1));
+            reg.rs1 = stoi(parts[2].substr(1));
+            reg.imm = stoi(parts[3]);
+        }
+    }
+
+    void executeInstruction(PipelineRegister& reg, vector<int>& memory, bool dataForwarding, Cache& cache) {
+        string instruction = reg.instruction;
+        vector<string> parts;
+        size_t spacePos = instruction.find(' ');
+        string opcode = instruction.substr(0, spacePos);
+        parts.push_back(opcode);
+
+        while (spacePos != std::string::npos) {
+            size_t nextSpacePos = instruction.find(' ', spacePos + 1);
+            string operand = instruction.substr(spacePos + 1, nextSpacePos - spacePos - 1);
+            parts.push_back(operand);
+            spacePos = nextSpacePos;
+        }
+
+        if (instructionLatency.find(opcode) != instructionLatency.end()) {
+            int latency = instructionLatency[opcode];
+
+            if (!dataForwarding) {
+                if (pipeline[1].instruction != "" && (pipeline[1].rd == reg.rs1 || pipeline[1].rd == reg.rs2)) {
+                    dataHazard = true;
+                }
+            } else {
+                if (pipeline[1].instruction != "" && (pipeline[1].rd == reg.rs1 || pipeline[1].rd == reg.rs2)) {
+                    if (pipeline[1].instruction.substr(0, 3) != "LD") {
+                        pipeline[1].rs1 = registers[pipeline[1].rd];
+                    }
+                }
+                if (pipeline[2].instruction != "" && (pipeline[2].rd == reg.rs1 || pipeline[2].rd == reg.rs2)) {
+                    if (pipeline[2].instruction.substr(0, 3) != "LD") {
+                        pipeline[2].rs1 = registers[pipeline[2].rd];
+                    }
+                }
+            }
+
+            if (opcode == "ADD" || opcode == "SUB" || opcode == "LD" || opcode == "JALR") {
+                int rd = stoi(parts[1].substr(1));
+                int rs1 = stoi(parts[2].substr(1));
+                if (parts.size() > 3)
+                    pipeline[2].rs2 = stoi(parts[3].substr(1));
+                pipeline[2].rd = rd;
+                pipeline[2].rs1 = rs1;
+            } else if (opcode == "ADDI") {
+                int rd = stoi(parts[1].substr(1));
+                int rs1 = stoi(parts[2].substr(1));
+                pipeline[2].rd = rd;
+                pipeline[2].rs1 = rs1;
+                pipeline[2].imm = stoi(parts[3]);
+            }
+
+            for (int i = 0; i < latency; ++i) {
+                if (i != 0) {
+                    pipeline[0].instruction = opcode;
+                    executeInstruction(pipeline[2], memory, dataForwarding, cache);
+                }
+            }
+        }
+    }
+
+    void writeBack(PipelineRegister& reg) {
+        if (reg.instruction.substr(0, 4) == "EXIT")
+            return;
+
+        string instruction = reg.instruction;
+        vector<string> parts;
+        size_t spacePos = instruction.find(' ');
+        string opcode = instruction.substr(0, spacePos);
+        parts.push_back(opcode);
+
+        while (spacePos != std::string::npos) {
+            size_t nextSpacePos = instruction.find(' ', spacePos + 1);
+            string operand = instruction.substr(spacePos + 1, nextSpacePos - spacePos - 1);
+            parts.push_back(operand);
+            spacePos = nextSpacePos;
+        }
+
+        if (opcode == "ADD" || opcode == "SUB" || opcode == "LD" || opcode == "ADDI" || opcode == "JALR") {
+            int rd = stoi(parts[1].substr(1));
+            registers[rd] = reg.rd;
+        }
+    }
+};
+
+class Processor {
+public:
+    vector<int> memory;
+    int clock;
+    array<Core, 2> cores;
+    bool dataForwarding = false;
+    Cache cache;
+
+    Processor() : clock(0), memory(4096, 0), cores({Core(), Core()}), cache(8192, 64, 4, 10, Cache::LRU) {}
+
+    void run(Cache& cache) {
+        int totalStalls = 0;
+        int totalCacheMisses = 0;
+        double totalInstructions = 0;
+
+        while (!(cores[0].exitEncountered && cores[1].exitEncountered)) {
+            for (int i = 0; i < 2; ++i) {
+                cores[i].execute(memory, dataForwarding, cache);
+            }
+            detectStalls();
+            ++clock;
+        }
+
+        cout << "+============ After Run ============:" << endl;
+        for (int i = 0; i < 2; ++i) {
+            for (int reg : cores[i].registers) {
+                cout << reg << ' ';
+            }
+            cout << endl;
+        }
+
+        for (int i = 0; i < 2; ++i) {
+            // Corrected accessing cacheMisses for each core
+            totalStalls += cores[i].stalls;
+            totalInstructions += cores[i].pc;
+            totalCacheMisses += cores[i].pipeline[0].cycle; // Assuming the pipeline[0].cycle is used to track cache misses
+        }
+
+        cout << "Number of Stalls: " << totalStalls << endl;
+        cout << "Cache Miss Rate: " << fixed << setprecision(2) << (totalCacheMisses / totalInstructions) << endl;
+        cout << "Instructions Per Cycle (IPC): " << fixed << setprecision(2) << (totalInstructions != 0 ? (totalInstructions / clock) : 0) << endl;
+    }
+
+    void detectStalls() {
+        for (int i = 0; i < 2; ++i) {
+            Core& core = cores[i];
+            if (core.pipeline[1].instruction != "" && core.pipeline[2].instruction != "") {
+                string rd = core.pipeline[1].instruction.substr(4, 2);
+                string rs1 = core.pipeline[2].instruction.substr(8, 2);
+                string rs2 = core.pipeline[2].instruction.substr(12, 2);
+                if (rs1 == rd || rs2 == rd) {
+                    core.dataHazard = true;
+                }
+            }
+        }
+    }
+};
+
+int main() {
+    cout << "Do you want to enable data forwarding? (1/0): ";
+    char choice;
+    cin >> choice;
+    bool dataForwarding = (toupper(choice) == '1');
+
+    cout << "Enter the file name to be opened: ";
+    string fileName;
+    cin >> fileName;
+
+    ifstream file(fileName);
+    if (!file.is_open()) {
+       
+
+ cerr << "ERROR opening file" << endl;
+        return -1;
+    }
+
+    string line;
+    vector<string> program;
+    while (getline(file, line)) {
+        program.push_back(line);
+    }
+    file.close();
+
+    cout << "Enter cache size, block size, associativity, access latency, and replacement policy (LRU/FIFO): ";
+    int cacheSize, blockSize, associativity, accessLatency;
+    string replacementPolicyStr;
+    cin >> cacheSize >> blockSize >> associativity >> accessLatency >> replacementPolicyStr;
+    Cache::ReplacementPolicy replacementPolicy = (replacementPolicyStr == "LRU") ? Cache::LRU : Cache::FIFO;
+
+    Cache cache(cacheSize, blockSize, associativity, accessLatency, replacementPolicy);
+    Processor sim;
+
+    for (int i = 0; i < 2; ++i) {
+        sim.cores[i].program = program;
+    }
+
+    sim.run(cache);
+
+    return 0;
+}

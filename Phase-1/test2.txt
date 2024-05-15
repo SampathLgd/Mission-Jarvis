@@ -1,0 +1,12 @@
+.data
+arriay: .word 3 3 4 3
+msg: .string "Hello World"
+LI X1 10
+LI X2 123
+LD X5 1500
+LD X6 1501
+ADDI X7 X7 11
+ADD X3 X2 X1 
+SUB X4 X2 X1
+
+EXIT
